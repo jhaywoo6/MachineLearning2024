@@ -9,11 +9,14 @@ from torch import autocast, GradScaler
 from torch.utils.data import Dataset, DataLoader
 import csv
 import torch.multiprocessing as mp
+import os
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic=False
 mp.set_start_method('spawn', force=True) 
+checkpoint_dir = "C:/Users/Jacob/Prob2Checkpoints"
+os.makedirs(checkpoint_dir, exist_ok=True)
 
 class CharRNN(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, rnn_type="RNN", fc_layers=1):
@@ -71,20 +74,58 @@ class ShakespeareDataset(Dataset):
 def model_size(model, shared_params, shared_size, model_num):
     shared_params[model_num] = sum(p.numel() for p in model.parameters())
     shared_size[model_num] = shared_params[model_num] * 4 / (1024 * 1024)
+
+def save_checkpoint(model, optimizer, epoch, model_num, elapsed_time, avg_train_loss, avg_val_loss, val_accuracy):
+    checkpoint_path = os.path.join(checkpoint_dir, f"model_{model_num}_epoch_{epoch}.pth")
+    existing_checkpoints = [f for f in os.listdir(checkpoint_dir) if f.startswith(f"model_{model_num}_")]
+    print(existing_checkpoints)
+    for checkpoint in existing_checkpoints:
+        os.remove(os.path.join(checkpoint_dir, checkpoint))
+        print(f"Removed previous checkpoint: {checkpoint}")
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'elapsed_time': elapsed_time,
+        'avg_train_loss': avg_train_loss,
+        'avg_val_loss': avg_val_loss,
+        'val_accuracy': val_accuracy,
+    }, checkpoint_path)
+    print(f"Checkpoint saved: {checkpoint_path}")
+
+def load_checkpoint(model, optimizer, model_num):
+    checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.startswith(f"model_{model_num}_")]
+    if not checkpoint_files:
+        return 0, 0, 0, 0, 0
+
+    checkpoint_files.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+    latest_checkpoint = checkpoint_files[-1]
+    checkpoint_path = os.path.join(checkpoint_dir, latest_checkpoint)
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    print(f"Resuming training from {checkpoint_path}")
+
+    return checkpoint['epoch'], checkpoint['elapsed_time'], checkpoint['avg_train_loss'], checkpoint['avg_val_loss'], checkpoint['val_accuracy']
     
 def train_model(model, train_loader, val_loader, model_num, shared_training_loss, shared_validation_loss, shared_acc, shared_time):
-    start_time = time.time()
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scaler = GradScaler()
     model.to(device)
-    for epoch in range(epochs):
+
+    start_epoch, elapsed_time, avg_train_loss, avg_val_loss, val_accuracy = load_checkpoint(model, optimizer, model_num)
+    
+    for epoch in range(start_epoch, epochs):
         model.train()
         epoch_loss = 0
+        start_epoch_time = time.time()
+        
         for X_batch, y_batch in train_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             optimizer.zero_grad()
-            with autocast(str(device), dtype=torch.float16):
+            with autocast(str(device)):
                 output = model(X_batch)
                 loss = criterion(output, y_batch)
 
@@ -103,7 +144,7 @@ def train_model(model, train_loader, val_loader, model_num, shared_training_loss
         with torch.no_grad():
             for X_val, y_val in val_loader:
                 X_val, y_val = X_val.to(device), y_val.to(device)
-                with autocast(str(device), dtype=torch.float16):
+                with autocast(str(device)):
                     val_output = model(X_val)
                     loss = criterion(val_output, y_val)
                 val_loss += loss.item()
@@ -114,13 +155,19 @@ def train_model(model, train_loader, val_loader, model_num, shared_training_loss
         avg_val_loss = val_loss / len(val_loader)
         val_accuracy = correct / total
 
-        if (epoch + 1) % 10 == 0:
-            print(f'Model {model_num+1}, Epoch {epoch+1}, Training Loss: {avg_train_loss:.4f}, Validation Loss: {avg_val_loss:.4f}, Validation Accuracy: {val_accuracy:.4f}')
+        epoch_time = time.time() - start_epoch_time
+        elapsed_time += epoch_time
 
+        print(f"Epoch {epoch+1} | Time: {epoch_time:.2f}s | Total elapsed: {elapsed_time:.2f}s")
+
+        if (epoch + 1) % 10 == 0:
+            save_checkpoint(model, optimizer, epoch+1, model_num, elapsed_time, avg_train_loss, avg_val_loss, val_accuracy)
+
+    total_training_time = elapsed_time
     shared_training_loss[model_num] = avg_train_loss
     shared_validation_loss[model_num] = avg_val_loss
     shared_acc[model_num] = val_accuracy
-    shared_time[model_num] = time.time() - start_time
+    shared_time[model_num] = total_training_time
 
 def predict_next_char(model, char_to_ix, ix_to_char, initial_str, max_length):
     model.eval()
@@ -205,7 +252,7 @@ if __name__ == '__main__':
         model_num += 1
         start_time = time.time()
         generated_sequence = test_str
-        max_sequence_length = 100
+        max_sequence_length = 1000
 
         for _ in range(max_sequence_length):
             predicted_char = predict_next_char(i, char_to_ix, ix_to_char, generated_sequence, model_length[model_num])
@@ -237,7 +284,7 @@ if __name__ == '__main__':
 
     header = [
         "Model", "RNN Type", "Sequence Length", "Training Loss", "Validation Loss", "Validation Accuracy", 
-        "Training time", "Inference Time", "Hidden Size", "Fully Connected Layers", "Parameters", "Size (MB)", "Predicted next characters"
+        "Training time", "Inference Time", "Hidden Size", "Fully Connected Layers", "Parameters", "Size (MB)", "Predicted next character"
     ]
 
     with open('model_results_spear.csv', 'w', newline='') as csvfile:
